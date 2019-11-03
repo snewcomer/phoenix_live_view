@@ -8,6 +8,7 @@ See the hexdocs at `https://hexdocs.pm/phoenix_live_view` for documentation.
 */
 
 import morphdom from "morphdom"
+import { ClickModifier } from "./click-modifier"
 
 const CLIENT_OUTDATED = "outdated"
 const RELOAD_JITTER = [1000, 10000]
@@ -47,6 +48,7 @@ const DEBOUNCE_PREV_KEY = "debounce-prev-key"
 const DYNAMICS = "d"
 const STATIC = "s"
 const COMPONENTS = "c"
+const CLICK_COLLECTION = new WeakMap();
 
 let logError = (msg, obj) => console.error && console.error(msg, obj)
 
@@ -394,7 +396,6 @@ export class LiveSocket {
   }
 
   bindTopLevelEvents(){
-    this.bindClicks()
     this.bindNav()
     this.bindForms()
     this.bindTargetable({keyup: "keyup", keydown: "keydown"}, (e, type, view, target, phxEvent, phxTarget) => {
@@ -472,33 +473,6 @@ export class LiveSocket {
         }
       })
     }
-  }
-
-  bindClicks(){
-    window.addEventListener("click", e => {
-      let click = this.binding("click")
-      let target = closestPhxBinding(e.target, click)
-      let phxEvent = target && target.getAttribute(click)
-      if(!phxEvent){ return }
-      e.preventDefault()
-
-      let meta = {
-        altKey: e.altKey,
-        shiftKey: e.shiftKey,
-        ctrlKey: e.ctrlKey,
-        metaKey: e.metaKey,
-        x: e.x || e.clientX,
-        y: e.y || e.clientY,
-        pageX: e.pageX,
-        pageY: e.pageY,
-        screenX: e.screenX,
-        screenY: e.screenY,
-      }
-
-      this.owner(target, view => {
-        this.debounce(target, e, () => view.pushEvent("click", target, phxEvent, meta))
-      })
-    }, false)
   }
 
   bindNav(){
@@ -926,6 +900,7 @@ export class View {
     this.view = this.el.getAttribute(PHX_VIEW)
     this.loaderTimer = null
     this.pendingDiffs = []
+    this.modifiers = []
     this.href = href
     this.joinedOnce = false
     this.viewHooks = {}
@@ -966,6 +941,14 @@ export class View {
         .receive("error", onFinished)
         .receive("timeout", onFinished)
     }
+
+    // cleanup storage
+    this.cleanupClickModifiers();
+  }
+
+  cleanupClickModifiers() {
+    this.modifiers.forEach(mod => mod.destroy());
+    this.modifiers = [];
   }
 
   setContainerClasses(...classes){
@@ -1012,6 +995,58 @@ export class View {
       let {kind, to} = live_redirect
       Browser.pushState(kind, {}, to)
     }
+    this.attachClicks();
+  }
+
+  attachClicks() {
+    const treeWalker = document.createTreeWalker(this.el, NodeFilter.SHOW_ELEMENT);
+
+    let el;
+    while(el = treeWalker.nextNode()) {
+      if (el.getAttribute('phx-click')) {
+        if (!CLICK_COLLECTION.has(el)) {
+          const modifier = new ClickModifier(el, {
+            eventName: 'click',
+            callback: callback.bind(this),
+            options: {}
+          });
+          modifier.install();
+
+          // storage for cleanup later
+          this.modifiers.push(modifier);
+          // to avoid blowing up memory with class instances
+          CLICK_COLLECTION.set(el, modifier);
+        } else {
+          const modifier = CLICK_COLLECTION.get(el);
+          modifier.reinstall();
+        }
+      }
+    }
+
+    function callback(e) {
+      let click = this.binding("click")
+      const { target } = e;
+      let phxEvent = target && target.getAttribute(click)
+      if(!phxEvent){ return }
+      e.stopPropagation();
+
+      let meta = {
+        altKey: e.altKey,
+        shiftKey: e.shiftKey,
+        ctrlKey: e.ctrlKey,
+        metaKey: e.metaKey,
+        x: e.x || e.clientX,
+        y: e.y || e.clientY,
+        pageX: e.pageX,
+        pageY: e.pageY,
+        screenX: e.screenX,
+        screenY: e.screenY,
+      }
+
+      this.liveSocket.owner(target, view => {
+        this.liveSocket.debounce(target, e, () => this.pushEvent("click", target, phxEvent, meta))
+      })
+    }
   }
 
   joinNewChildren(){
@@ -1038,6 +1073,7 @@ export class View {
       this.joinNewChildren()
     }
     this.triggerHooks(changes)
+    this.attachClicks();
   }
 
   getHook(el){ return this.viewHooks[ViewHook.elementID(el)] }
