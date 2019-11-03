@@ -8,6 +8,7 @@ See the hexdocs at `https://hexdocs.pm/phoenix_live_view` for documentation.
 */
 
 import morphdom from "morphdom"
+import { ClickModifier } from "./click-modifier"
 
 const CLIENT_OUTDATED = "outdated"
 const RELOAD_JITTER = [1000, 10000]
@@ -18,6 +19,11 @@ const PHX_CONNECTED_CLASS = "phx-connected"
 const PHX_LOADING_CLASS = "phx-loading"
 const PHX_DISCONNECTED_CLASS = "phx-disconnected"
 const PHX_ERROR_CLASS = "phx-error"
+const PHX_CLICK_ONCE = "phx-click-once"
+const PHX_CLICK_CAPTURE = "phx-click-capture"
+const PHX_CLICK_PASSIVE = "phx-click-passive"
+const PHX_BUBBLES = "phx-bubbles" // TODO: stopPropagation or bubbles by default
+const PHX_PREVENT_DEFAULT = "phx-prevent-default"
 const PHX_PARENT_ID = "data-phx-parent-id"
 const PHX_VIEW_SELECTOR = `[${PHX_VIEW}]`
 const PHX_ERROR_FOR = "data-phx-error-for"
@@ -394,7 +400,6 @@ export class LiveSocket {
   }
 
   bindTopLevelEvents(){
-    this.bindClicks()
     this.bindNav()
     this.bindForms()
     this.bindTargetable({keyup: "keyup", keydown: "keydown"}, (e, type, view, target, phxEvent, phxTarget) => {
@@ -472,33 +477,6 @@ export class LiveSocket {
         }
       })
     }
-  }
-
-  bindClicks(){
-    window.addEventListener("click", e => {
-      let click = this.binding("click")
-      let target = closestPhxBinding(e.target, click)
-      let phxEvent = target && target.getAttribute(click)
-      if(!phxEvent){ return }
-      e.preventDefault()
-
-      let meta = {
-        altKey: e.altKey,
-        shiftKey: e.shiftKey,
-        ctrlKey: e.ctrlKey,
-        metaKey: e.metaKey,
-        x: e.x || e.clientX,
-        y: e.y || e.clientY,
-        pageX: e.pageX,
-        pageY: e.pageY,
-        screenX: e.screenX,
-        screenY: e.screenY,
-      }
-
-      this.owner(target, view => {
-        this.debounce(target, e, () => view.pushEvent("click", target, phxEvent, meta))
-      })
-    }, false)
   }
 
   bindNav(){
@@ -926,6 +904,7 @@ export class View {
     this.view = this.el.getAttribute(PHX_VIEW)
     this.loaderTimer = null
     this.pendingDiffs = []
+    this.clickCollection = new WeakMap();
     this.href = href
     this.joinedOnce = false
     this.viewHooks = {}
@@ -966,6 +945,9 @@ export class View {
         .receive("error", onFinished)
         .receive("timeout", onFinished)
     }
+
+    this.rootObserver.disconnect();
+    this.clickCollection = null;
   }
 
   setContainerClasses(...classes){
@@ -1012,7 +994,115 @@ export class View {
       let {kind, to} = live_redirect
       Browser.pushState(kind, {}, to)
     }
+    this.observeRoot()
+    this.attachClicks(this.el)
   }
+
+  observeRoot() {
+    let clickAttribute = this.binding("click")
+
+    function callback(mutationList) {
+      // manage addition and removal of nodes
+      for (let mutation of mutationList) {
+        mutation.addedNodes.forEach(added => {
+          if (added instanceof HTMLElement) {
+            this.attachClicks(added)
+          }
+        })
+        mutation.removedNodes.forEach(removed => {
+          if (removed instanceof HTMLElement) {
+            this.detachClicks(removed)
+          }
+        })
+      }
+    }
+    this.rootObserver = new MutationObserver(callback.bind(this))
+    this.rootObserver.observe(this.el, { childList: true, subtree: true })
+  }
+
+  attachClicks(el) {
+    let clickBinding = this.binding("click")
+    let treeWalker = document.createTreeWalker(el, NodeFilter.SHOW_ELEMENT)
+
+    let currentEl = el
+    do {
+      if (currentEl.getAttribute(clickBinding)) {
+        if (!this.clickCollection.has(currentEl)) {
+          let once = currentEl.getAttribute(PHX_CLICK_ONCE)
+          let capture = currentEl.getAttribute(PHX_CLICK_CAPTURE)
+          let passive = currentEl.getAttribute(PHX_CLICK_PASSIVE)
+          let options = {
+            ...(once && { once: Boolean(once) }),
+            ...(capture && { capture: Boolean(capture) }),
+            ...(passive && { passive: Boolean(passive) })
+          }
+          let modifier = new ClickModifier(currentEl, {
+            eventName: 'click',
+            callback: clickCallback.bind(this),
+            options
+          })
+
+          // start listenening for click events
+          modifier.addListener()
+
+          // to avoid blowing up memory with class instances
+          // we create a weak ref
+          this.clickCollection.set(currentEl, modifier)
+        } else {
+          let modifier = this.clickCollection.get(currentEl)
+          modifier.reinstall()
+        }
+      }
+    } while((currentEl = treeWalker.nextNode(), currentEl))
+
+    function clickCallback(e) {
+      let { target } = e;
+      let phxEvent = target && target.getAttribute(clickBinding)
+      if(!phxEvent){ return }
+
+      // stopPropagation by default
+      // or do we allow bubbles and require stop-propagation to ensure users are
+      // intentional?
+      if (!target.getAttribute(PHX_BUBBLES)) {
+        e.stopPropagation();
+      }
+      if (target.getAttribute(PHX_PREVENT_DEFAULT)) {
+        e.preventDefault();
+      }
+
+      let meta = {
+        altKey: e.altKey,
+        shiftKey: e.shiftKey,
+        ctrlKey: e.ctrlKey,
+        metaKey: e.metaKey,
+        x: e.x || e.clientX,
+        y: e.y || e.clientY,
+        pageX: e.pageX,
+        pageY: e.pageY,
+        screenX: e.screenX,
+        screenY: e.screenY,
+      }
+
+      this.liveSocket.owner(target, view => {
+        this.liveSocket.debounce(target, e, () => this.pushEvent("click", target, phxEvent, meta))
+      })
+    }
+  }
+
+  detachClicks(el) {
+    let clickBinding = this.binding("click")
+    let treeWalker = document.createTreeWalker(el, NodeFilter.SHOW_ELEMENT)
+
+    let currentEl = el
+    do {
+      if (currentEl.getAttribute(clickBinding)) {
+        if (this.clickCollection.has(currentEl)) {
+          this.clickCollection.delete(currentEl)
+        }
+      }
+    } while((currentEl = treeWalker.nextNode(), currentEl))
+  }
+
 
   joinNewChildren(){
     DOM.all(document, `${PHX_VIEW_SELECTOR}[${PHX_PARENT_ID}="${this.id}"]`, el => {
