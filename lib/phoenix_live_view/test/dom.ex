@@ -112,7 +112,7 @@ defmodule Phoenix.LiveViewTest.DOM do
 
   def all(html_tree, selector), do: Floki.find(html_tree, selector)
 
-  def parse(html), do: Floki.parse(html)
+  def parse(html), do: Floki.parse_document(html)
 
   def attrs({_tag, attrs, _children}), do: Enum.into(attrs, %{})
   def attrs({_tag, attrs, _children}, key), do: Enum.into(attrs, %{})[key]
